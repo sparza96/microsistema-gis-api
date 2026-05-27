@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+osmnx
+folium
+numpy
+pandas
+shapely
+geopandas
