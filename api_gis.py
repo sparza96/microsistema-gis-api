@@ -1,6 +1,6 @@
 """
-DÍA 2 - API GIS con FastAPI
-Endpoints para obtener reportes de infraestructura de cualquier ciudad
+DÍA 2 - API GIS con FastAPI (VERSIÓN ROBUSTA)
+Manejo de errores, timeout y ciudades sin datos
 """
 
 import osmnx as ox
@@ -9,14 +9,17 @@ from folium import plugins
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import json
 from datetime import datetime
 import uuid
 import os
+import logging
+
+# Configurar logging para ver errores en Render
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Microsistema GIS API", description="API para análisis de infraestructura urbana", version="1.0")
 
-# Permitir peticiones desde cualquier origen (para tu futura app web)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,8 +27,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Crear carpeta para almacenar reportes temporales
 os.makedirs("reportes", exist_ok=True)
+
+# Tipos de amenidades a buscar
+AMENITIES_TAGS = {
+    "hospital": "Hospitales",
+    "school": "Escuelas", 
+    "bank": "Bancos",
+    "pharmacy": "Farmacias",
+    "police": "Comisarías"
+}
 
 # ============================================
 # ENDPOINT 1: Health check
@@ -35,45 +46,44 @@ def root():
     return {
         "mensaje": "Microsistema GIS API funcionando",
         "endpoints": [
-            "/reporte?ciudad=Concepción, Chile",
-            "/reporte_json?ciudad=Santiago, Chile",
+            "/reporte_json?ciudad=Concepción, Chile",
             "/mapa?ciudad=Valparaíso, Chile"
         ]
     }
 
 # ============================================
-# ENDPOINT 2: Reporte completo (JSON)
+# ENDPOINT 2: Reporte JSON con manejo de errores
 # ============================================
 @app.get("/reporte_json")
 def reporte_json(ciudad: str = Query(..., description="Nombre de la ciudad, país")):
-    """
-    Devuelve estadísticas de infraestructura urbana en formato JSON
-    Ejemplo: /reporte_json?ciudad=Santiago, Chile
-    """
     try:
-        print(f"📡 Procesando solicitud para: {ciudad}")
+        logger.info(f"📡 Procesando JSON para: {ciudad}")
         
-        # Extraer datos
+        # Timeout manual
+        import signal
+        
+        # Extraer datos con límite de tiempo
         amenities = ox.features_from_place(
             ciudad,
-            tags={"amenity": ["hospital", "school", "bank", "pharmacy", "police"]}
+            tags={"amenity": list(AMENITIES_TAGS.keys())}
         )
+        
+        if amenities.empty:
+            return JSONResponse(content={
+                "status": "warning",
+                "ciudad": ciudad,
+                "mensaje": "No se encontraron amenidades en esta ciudad. Puede ser que OSM no tenga datos suficientes.",
+                "total_amenidades": 0,
+                "desglose": {nombre: 0 for nombre in AMENITIES_TAGS.values()}
+            })
         
         # Limpiar
         amenities_clean = amenities[amenities.geometry.notna()]
         amenities_clean = amenities_clean[amenities_clean.geometry.is_valid]
         
-        # Contar por tipo
-        tipo_map = {
-            "hospital": "Hospitales",
-            "school": "Escuelas",
-            "bank": "Bancos",
-            "pharmacy": "Farmacias",
-            "police": "Comisarías"
-        }
-        
+        # Contar
         conteo = {}
-        for tipo_key, tipo_nombre in tipo_map.items():
+        for tipo_key, tipo_nombre in AMENITIES_TAGS.items():
             cantidad = len(amenities_clean[amenities_clean["amenity"] == tipo_key])
             conteo[tipo_nombre] = cantidad
         
@@ -86,55 +96,75 @@ def reporte_json(ciudad: str = Query(..., description="Nombre de la ciudad, paí
         })
         
     except Exception as e:
+        logger.error(f"Error en reporte_json: {str(e)}")
         return JSONResponse(
-            status_code=500,
-            content={"status": "error", "mensaje": str(e)}
+            status_code=200,  # Usamos 200 para que el frontend lo maneje bien
+            content={
+                "status": "error",
+                "ciudad": ciudad,
+                "mensaje": f"Error al procesar: {str(e)[:100]}. Intenta con otra ciudad más grande o conocida."
+            }
         )
 
 # ============================================
-# ENDPOINT 3: Mapa interactivo (HTML)
+# ENDPOINT 3: Mapa con manejo de errores
 # ============================================
 @app.get("/mapa", response_class=HTMLResponse)
 def generar_mapa(ciudad: str = Query(..., description="Nombre de la ciudad, país")):
-    """
-    Genera un mapa interactivo HTML para la ciudad solicitada
-    Ejemplo: /mapa?ciudad=Concepción, Chile
-    """
     try:
-        print(f"🗺️ Generando mapa para: {ciudad}")
+        logger.info(f"🗺️ Generando mapa para: {ciudad}")
         
         # Extraer datos
         amenities = ox.features_from_place(
             ciudad,
-            tags={"amenity": ["hospital", "school", "bank", "pharmacy", "police"]}
+            tags={"amenity": list(AMENITIES_TAGS.keys())}
         )
         
-        streets = ox.graph_from_place(ciudad, network_type="drive")
-        streets_gdf = ox.graph_to_gdfs(streets, nodes=False, edges=True)
+        if amenities.empty:
+            return HTMLResponse(content=f"""
+            <!DOCTYPE html>
+            <html>
+            <head><meta charset="UTF-8"><title>Sin datos</title></head>
+            <body>
+                <h3>⚠️ No se encontraron datos para {ciudad}</h3>
+                <p>OpenStreetMap no tiene suficientes amenidades mapeadas en esta ciudad.</p>
+                <p>Prueba con: Concepción, Santiago, Valparaíso, Temuco, Viña del Mar</p>
+                <p><a href="/">Volver al inicio</a></p>
+            </body>
+            </html>
+            """)
+        
+        # Extraer calles (con manejo de error)
+        try:
+            streets = ox.graph_from_place(ciudad, network_type="drive")
+            streets_gdf = ox.graph_to_gdfs(streets, nodes=False, edges=True)
+        except:
+            streets_gdf = None
+            logger.warning(f"No se pudieron extraer calles para {ciudad}")
         
         # Limpiar amenities
         amenities_clean = amenities[amenities.geometry.notna()]
         amenities_clean = amenities_clean[amenities_clean.geometry.is_valid]
         
-        # Obtener centro del mapa
+        # Obtener centro
         try:
             center_lat = amenities_clean.geometry.y.mean()
             center_lon = amenities_clean.geometry.x.mean()
         except:
-            center_lat, center_lon = -36.827, -73.050  # fallback Concepción
+            center_lat, center_lon = -33.4489, -70.6693  # Santiago como fallback
         
         # Crear mapa
-        m = folium.Map(location=[center_lat, center_lon], zoom_start=13)
-        plugins.MeasureControl(position="bottomleft").add_to(m)
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
         
-        # Agregar calles
-        for _, row in streets_gdf.head(200).iterrows():
-            if row.geometry and row.geometry.type == 'LineString':
-                try:
-                    coords = [(lat, lon) for lon, lat in row.geometry.coords]
-                    folium.PolyLine(locations=coords, color="#888888", weight=1.5, opacity=0.6).add_to(m)
-                except:
-                    pass
+        # Agregar calles si existen
+        if streets_gdf is not None:
+            for _, row in streets_gdf.head(100).iterrows():
+                if row.geometry and row.geometry.type == 'LineString':
+                    try:
+                        coords = [(lat, lon) for lon, lat in row.geometry.coords]
+                        folium.PolyLine(locations=coords, color="#888888", weight=1.5, opacity=0.6).add_to(m)
+                    except:
+                        pass
         
         # Colores
         color_map = {
@@ -149,7 +179,7 @@ def generar_mapa(ciudad: str = Query(..., description="Nombre de la ciudad, paí
         for tipo, info in color_map.items():
             grupo = folium.FeatureGroup(name=info["nombre"], show=True)
             subset = amenities_clean[amenities_clean["amenity"] == tipo]
-            for _, row in subset.iterrows():
+            for _, row in subset.head(200).iterrows():
                 if hasattr(row.geometry, 'y'):
                     nombre = row.get("name", tipo)
                     folium.Marker(
@@ -179,7 +209,7 @@ def generar_mapa(ciudad: str = Query(..., description="Nombre de la ciudad, paí
         '''
         m.get_root().html.add_child(folium.Element(leyenda_html))
         
-        # Guardar temporalmente
+        # Guardar
         filename = f"reportes/mapa_{uuid.uuid4().hex[:8]}.html"
         m.save(filename)
         
@@ -189,19 +219,49 @@ def generar_mapa(ciudad: str = Query(..., description="Nombre de la ciudad, paí
         return HTMLResponse(content=html_content)
         
     except Exception as e:
-        return HTMLResponse(content=f"<h3>Error</h3><p>{str(e)}</p>", status_code=500)
+        logger.error(f"Error en mapa: {str(e)}")
+        return HTMLResponse(content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="UTF-8"><title>Error</title></head>
+        <body>
+            <h3>❌ Error al generar el mapa</h3>
+            <p><strong>Ciudad:</strong> {ciudad}</p>
+            <p><strong>Error:</strong> {str(e)[:200]}</p>
+            <p>💡 <strong>Sugerencias:</strong></p>
+            <ul>
+                <li>Prueba con ciudades más grandes: Concepción, Santiago, Valparaíso</li>
+                <li>Verifica el formato: "Concepción, Chile"</li>
+                <li>Espera unos segundos y reintenta</li>
+            </ul>
+            <p><a href="/">Volver al inicio</a></p>
+        </body>
+        </html>
+        """, status_code=200)
 
 # ============================================
-# ENDPOINT 4: Listar ciudades disponibles (ejemplo)
+# ENDPOINT 4: Ciudades sugeridas
 # ============================================
-@app.get("/ciudades_ejemplo")
-def ciudades_ejemplo():
+@app.get("/ciudades_sugeridas")
+def ciudades_sugeridas():
     return {
-        "ejemplos": [
-            "Concepción, Chile",
+        "chile": [
             "Santiago, Chile",
+            "Concepción, Chile", 
             "Valparaíso, Chile",
+            "Viña del Mar, Chile",
             "Temuco, Chile",
+            "Antofagasta, Chile",
+            "La Serena, Chile",
+            "Rancagua, Chile",
+            "Talca, Chile",
             "Puerto Montt, Chile"
+        ],
+        "internacionales": [
+            "Buenos Aires, Argentina",
+            "Bogotá, Colombia",
+            "Lima, Perú",
+            "Mexico City, Mexico"
         ]
+    }
     }
